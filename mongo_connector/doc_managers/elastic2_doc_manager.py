@@ -73,6 +73,19 @@ __version__ = '0.3.0'
 """Elasticsearch 2.X DocManager version."""
 
 
+def exception_retry(f):
+    def wrapped(self, *args, **kwargs):
+        while True:
+            try:
+                return f(self, *args, **kwargs)
+            except elasticsearch.exceptions.TransportError as error:
+                LOG.exception("Function %s failed with exception: %s", f, error)
+                time.sleep(1)  # One second delay
+                LOG.info("Retrying after exception...")
+                continue
+    return wrapped
+
+
 def convert_aws_args(aws_args):
     """Convert old style options into arguments to boto3.session.Session."""
     if not isinstance(aws_args, dict):
@@ -112,6 +125,7 @@ class AutoCommiter(threading.Thread):
         buffered operations to Elasticsearch. Set to None or 0 to disable.
       - `sleep_interval`: Number of seconds to sleep.
     """
+
     def __init__(self, docman, send_interval, commit_interval,
                  sleep_interval=1):
         super(AutoCommiter, self).__init__()
@@ -325,9 +339,10 @@ class DocManager(DocManagerBase):
         # Leave _id, since it's part of the original document
         doc['_id'] = doc_id
 
-    @wrap_exceptions
+    @exception_retry
     def bulk_upsert(self, docs, namespace, timestamp):
         """Insert multiple documents into Elasticsearch."""
+
         def docs_to_upsert():
             doc = None
             for doc in docs:
@@ -355,6 +370,7 @@ class DocManager(DocManagerBase):
                 raise errors.EmptyDocsError(
                     "Cannot upsert an empty sequence of "
                     "documents into Elastic Search")
+
         try:
             kw = {}
             if self.chunk_size > 0:
@@ -472,23 +488,22 @@ class DocManager(DocManagerBase):
         if len(self.BulkBuffer.action_buffer) / 2 >= self.chunk_size or self.auto_commit_interval == 0:
             self.commit()
 
+    @exception_retry
     def send_buffered_operations(self):
         """Send buffered operations to Elasticsearch.
 
         This method is periodically called by the AutoCommitThread.
         """
         with self.lock:
-            try:
-                action_buffer = self.BulkBuffer.get_buffer()
-                if action_buffer:
-                    successes, errors = bulk(self.elastic, action_buffer)
-                    LOG.debug("Bulk request finished, successfully sent %d "
-                              "operations", successes)
-                    if errors:
-                        LOG.error(
-                            "Bulk request finished with errors: %r", errors)
-            except es_exceptions.ElasticsearchException:
-                LOG.exception("Bulk request failed with exception")
+            action_buffer = self.BulkBuffer.get_buffer()
+            if action_buffer:
+                successes, errors = bulk(self.elastic, action_buffer)
+                self.BulkBuffer.clean_up()  # cleanup if bulk did not throw exception
+                LOG.debug("Bulk request finished, successfully sent %d "
+                          "operations", successes)
+                if errors:
+                    LOG.error(
+                        "Bulk request finished with errors: %r", errors)
 
     def commit(self):
         """Send buffered requests and refresh all indexes."""
@@ -520,7 +535,6 @@ class DocManager(DocManagerBase):
 
 
 class BulkBuffer(object):
-
     def __init__(self, docman):
 
         # Parent object
@@ -693,5 +707,4 @@ class BulkBuffer(object):
             self.update_sources()
 
         ES_buffer = self.action_buffer
-        self.clean_up()
         return ES_buffer
